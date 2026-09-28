@@ -22,6 +22,29 @@ def index():
     return render_template("index.html")
 
 
+
+
+H3_FILES = {
+    "h3_cl_24_07.parquet",
+    "h3_cl_25_07.parquet",
+    "h3_cl_26_07.parquet",
+    "h3_hexagons_12_600_street_tr.parquet",
+}
+
+
+@app.get("/api/h3/<path:filename>")
+def h3_file(filename):
+    """Раздаёт браузеру только разрешённые H3 Parquet из data/."""
+    if Path(filename).name != filename or filename not in H3_FILES:
+        return jsonify({"error": "Файл H3 не разрешён"}), 404
+
+    path = DATA_DIR / filename
+    if not path.exists():
+        return jsonify({"error": f"H3 файл не найден: {filename}"}), 404
+
+    return send_file(path, mimetype="application/octet-stream", conditional=True)
+
+
 @app.post("/api/upload")
 def upload():
     f = request.files.get("file")

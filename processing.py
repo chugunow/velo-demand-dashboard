@@ -323,12 +323,18 @@ def _score_period(intersections, h3_data, period):
     g["rank_max"] = _percent_rank(g["max_trips"])
     g["rank_class"] = _percent_rank(g["avg_class"].fillna(0))
 
-    g["demand_score"] = 100 * (
-        0.35 * g["rank_avg"]
-        + 0.25 * g["rank_median"]
-        + 0.15 * g["rank_max"]
-        + 0.15 * g["rank_class"]
-        + 0.10 * g["homogeneity"]
+    g["contrib_avg"] = 35 * g["rank_avg"]
+    g["contrib_median"] = 25 * g["rank_median"]
+    g["contrib_max"] = 15 * g["rank_max"]
+    g["contrib_class"] = 15 * g["rank_class"]
+    g["contrib_homogeneity"] = 10 * g["homogeneity"]
+
+    g["demand_score"] = (
+        g["contrib_avg"]
+        + g["contrib_median"]
+        + g["contrib_max"]
+        + g["contrib_class"]
+        + g["contrib_homogeneity"]
     )
 
     g["demand_category"] = _demand_category(
@@ -346,27 +352,26 @@ def _write_outputs(lanes, all_periods, job_dir):
 
     meta = lanes[["velo_id", "name", "type", "status", "zone"]]
 
-    # CSV по каждому периоду.
-    summary = meta.merge(all_periods, on="velo_id", how="left")
-
+    # CSV по каждому периоду: только велодорожки, для которых есть данные
+    # именно в этом периоде.
     for period in PERIODS:
-        p = summary[summary["period"] == period].copy()
-
+        p = all_periods[all_periods["period"] == period].copy()
+        p = meta.merge(p, on="velo_id", how="inner")
         p.to_csv(
             job_dir / f"velo_demand_{period}.csv",
             index=False,
             encoding="utf-8-sig",
         )
 
-    # Все периоды одной таблицей.
-    all_periods.to_csv(
+    # Все периоды одной таблицей — только фактически найденные связи.
+    all_out = meta.merge(all_periods, on="velo_id", how="inner")
+    all_out.to_csv(
         job_dir / "velo_demand_all_periods.csv",
         index=False,
         encoding="utf-8-sig",
     )
 
     # Итоговый score по трём периодам.
-    # Итоговый score и средняя однородность по трём периодам.
     score_pivot = all_periods.pivot_table(
         index="velo_id",
         columns="period",
@@ -388,6 +393,27 @@ def _write_outputs(lanes, all_periods, job_dir):
         aggfunc="first",
     ).reset_index()
 
+    # Метрики и вклад компонентов — для объяснения score в popup.
+    metric_map = {
+        "avg_trips": "avg_trips",
+        "median_trips": "median_trips",
+        "max_trips": "max_trips",
+        "avg_class": "avg_class",
+        "contrib_avg": "contrib_avg",
+        "contrib_median": "contrib_median",
+        "contrib_max": "contrib_max",
+        "contrib_class": "contrib_class",
+        "contrib_homogeneity": "contrib_homogeneity",
+    }
+    metric_pivots = {}
+    for source_col, prefix in metric_map.items():
+        metric_pivots[source_col] = all_periods.pivot_table(
+            index="velo_id",
+            columns="period",
+            values=source_col,
+            aggfunc="first",
+        ).reset_index()
+
     for period in PERIODS:
         if period not in score_pivot.columns:
             score_pivot[period] = np.nan
@@ -395,14 +421,20 @@ def _write_outputs(lanes, all_periods, job_dir):
             category_pivot[period] = np.nan
         if period not in hom_pivot.columns:
             hom_pivot[period] = np.nan
+        for pivot in metric_pivots.values():
+            if period not in pivot.columns:
+                pivot[period] = np.nan
 
     pivot = score_pivot.copy()
     pivot["score_3_periods"] = pivot[list(PERIODS)].mean(axis=1)
 
-    # Названия категорий для отдельных лет — чтобы фронтенд мог
-    # переключать цвет карты без нового запроса к серверу.
     for period in PERIODS:
         pivot[f"category_{period}"] = category_pivot[period].values
+
+        for source_col, mp in metric_pivots.items():
+            pivot[f"{source_col}_{period}"] = mp[period].values
+
+        pivot[f"homogeneity_{period}"] = hom_pivot[period].values
 
     pivot["homogeneity_3_periods"] = hom_pivot[list(PERIODS)].mean(axis=1)
     pivot["demand_category_3_periods"] = _demand_category(
@@ -410,30 +442,37 @@ def _write_outputs(lanes, all_periods, job_dir):
         pivot["homogeneity_3_periods"],
     )
 
-    summary_csv = meta.merge(pivot, on="velo_id", how="left")
+    # Убираем из итоговой геометрии велодорожки, по которым нет данных
+    # ни в одном из трёх периодов.
+    has_any_data = pivot[list(PERIODS)].notna().any(axis=1)
+    pivot = pivot[has_any_data].copy()
 
+    summary_csv = meta.merge(pivot, on="velo_id", how="inner")
     summary_csv.to_csv(
         job_dir / "velo_demand_summary_3_periods.csv",
         index=False,
         encoding="utf-8-sig",
     )
 
-    # Геометрия остаётся геометрией исходных велодорожек.
+    # Геометрия: только велодорожки с хотя бы одним периодом данных.
     geo = lanes.merge(
         summary_csv,
         on=["velo_id", "name", "type", "status", "zone"],
-        how="left",
+        how="inner",
     )
 
     geo = geo.replace([np.inf, -np.inf], np.nan)
-
     geo.to_file(
         job_dir / "result.geojson",
         driver="GeoJSON",
     )
 
-    return summary_csv
+    print(
+        f"[6/6] Lanes with data: {len(geo):,} / {len(lanes):,}",
+        flush=True,
+    )
 
+    return summary_csv
 
 def process_job(input_path, job_dir, data_dir, progress=None):
     """
@@ -592,6 +631,8 @@ def process_job(input_path, job_dir, data_dir, progress=None):
 
     return {
         "lanes": int(len(lanes)),
+        "lanes_with_data": int(len(summary_csv)),
+        "lanes_without_data": int(len(lanes) - len(summary_csv)),
         "h3_cells": int(unique_h3),
         "h3_candidates": int(unique_h3),
         "intersections": int(len(intersections)),
