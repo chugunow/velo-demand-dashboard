@@ -263,6 +263,32 @@ def _percent_rank(s):
     return (s.rank(method="min") - 1) / (n - 1)
 
 
+def _demand_category(score, homogeneity):
+    """
+    Категория спроса по согласованному CASE.
+    """
+    score = pd.to_numeric(score, errors="coerce")
+    homogeneity = pd.to_numeric(homogeneity, errors="coerce").fillna(0)
+
+    return np.select(
+        [
+            (score >= 75) & (homogeneity >= 0.6),
+            score >= 75,
+            (score >= 50) & (homogeneity >= 0.6),
+            score >= 50,
+            score >= 25,
+        ],
+        [
+            "1 - Высокий устойчивый спрос",
+            "1 - Высокий точечный спрос",
+            "2 - Умеренный устойчивый спрос",
+            "2 - Умеренный точечный спрос",
+            "3 - Пониженный спрос",
+        ],
+        default="4 - Низкий спрос",
+    )
+
+
 def _score_period(intersections, h3_data, period):
     x = intersections.merge(h3_data, on="h3_id", how="inner")
 
@@ -305,6 +331,11 @@ def _score_period(intersections, h3_data, period):
         + 0.10 * g["homogeneity"]
     )
 
+    g["demand_category"] = _demand_category(
+        g["demand_score"],
+        g["homogeneity"],
+    )
+
     g["period"] = period
 
     return g
@@ -335,18 +366,49 @@ def _write_outputs(lanes, all_periods, job_dir):
     )
 
     # Итоговый score по трём периодам.
-    pivot = all_periods.pivot_table(
+    # Итоговый score и средняя однородность по трём периодам.
+    score_pivot = all_periods.pivot_table(
         index="velo_id",
         columns="period",
         values="demand_score",
         aggfunc="first",
     ).reset_index()
 
-    for period in PERIODS:
-        if period not in pivot.columns:
-            pivot[period] = np.nan
+    category_pivot = all_periods.pivot_table(
+        index="velo_id",
+        columns="period",
+        values="demand_category",
+        aggfunc="first",
+    ).reset_index()
 
+    hom_pivot = all_periods.pivot_table(
+        index="velo_id",
+        columns="period",
+        values="homogeneity",
+        aggfunc="first",
+    ).reset_index()
+
+    for period in PERIODS:
+        if period not in score_pivot.columns:
+            score_pivot[period] = np.nan
+        if period not in category_pivot.columns:
+            category_pivot[period] = np.nan
+        if period not in hom_pivot.columns:
+            hom_pivot[period] = np.nan
+
+    pivot = score_pivot.copy()
     pivot["score_3_periods"] = pivot[list(PERIODS)].mean(axis=1)
+
+    # Названия категорий для отдельных лет — чтобы фронтенд мог
+    # переключать цвет карты без нового запроса к серверу.
+    for period in PERIODS:
+        pivot[f"category_{period}"] = category_pivot[period].values
+
+    pivot["homogeneity_3_periods"] = hom_pivot[list(PERIODS)].mean(axis=1)
+    pivot["demand_category_3_periods"] = _demand_category(
+        pivot["score_3_periods"],
+        pivot["homogeneity_3_periods"],
+    )
 
     summary_csv = meta.merge(pivot, on="velo_id", how="left")
 
