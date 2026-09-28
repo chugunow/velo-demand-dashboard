@@ -6,6 +6,8 @@ services:
     buildCommand: pip install -r requirements.txt && python prepare_h3.py
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 900
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.5"
       - key: MAX_UPLOAD_MB
         value: "50"
       - key: DATA_DIR
