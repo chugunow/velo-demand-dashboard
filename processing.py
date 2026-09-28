@@ -1,14 +1,15 @@
 from pathlib import Path
 import hashlib
-import json
 import gc
-import os
+import json
 
+import h3
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import shape
-import h3
+from shapely.geometry import shape, Polygon
+from shapely.ops import transform
+from pyproj import Transformer
 
 
 PERIODS = {
@@ -17,15 +18,16 @@ PERIODS = {
     "26_07": "h3_cl_26_07.parquet",
 }
 
-
-# Cache is process-local. With one Render worker this means the expensive
-# H3 dictionary is loaded only once and is reused by subsequent uploads.
-_H3_CACHE = None
+H3_RESOLUTION = 12
+# We deliberately make the candidate area larger than the real 5 m buffer.
+# Final selection is still done by exact intersection with the real 5 m buffer.
+CANDIDATE_BUFFER_M = 30
+FINAL_BUFFER_M = 5
 
 
 def _progress(cb, n, msg):
     if cb:
-        cb(n, msg)
+        cb(int(n), msg)
 
 
 def _find_col(df, candidates):
@@ -36,76 +38,12 @@ def _find_col(df, candidates):
     return None
 
 
-def _load_h3_lookup(data_dir):
-    global _H3_CACHE
-    if _H3_CACHE is not None:
-        return _H3_CACHE
-
-    # Preferred format: GeoParquet prepared once during Render build.
-    geo_path = Path(data_dir) / "h3_lookup.parquet"
-    if geo_path.exists():
-        g = gpd.read_parquet(geo_path, columns=["h3_id", "geometry"])
-        if g.crs is None:
-            g = g.set_crs(4326)
-        elif g.crs.to_epsg() != 4326:
-            g = g.to_crs(4326)
-        _H3_CACHE = g
-        return g
-
-    # Fallback for local testing: original WKT parquet.
-    src = Path(data_dir) / "h3_hexagons_12_600_street_tr.parquet"
-    if not src.exists():
-        raise FileNotFoundError(
-            f"Не найден H3 dictionary: {src}. "
-            "Положите его в data/ или подготовьте h3_lookup.parquet."
-        )
-
-    df = pd.read_parquet(src, columns=["h3_id", "wkt"])
-    g = gpd.GeoDataFrame(
-        df[["h3_id"]].copy(),
-        geometry=gpd.GeoSeries.from_wkt(df["wkt"]),
-        crs=4326,
-    )
-    _H3_CACHE = g
-    return g
-
-
-def _read_h3_period(path):
-    df = pd.read_parquet(path)
-
-    h3_col = _find_col(df, ["h3_id", "h3", "hexagon", "index"])
-    trip_col = _find_col(df, ["sum_trip", "trips", "trip_count", "count"])
-    class_col = _find_col(df, ["trip_class", "class", "cluster"])
-
-    if not h3_col or not trip_col or not class_col:
-        raise ValueError(
-            f"Не удалось определить колонки H3 в {path.name}. "
-            f"Найдены: {list(df.columns)}"
-        )
-
-    out = df[[h3_col, trip_col, class_col]].copy()
-    out.columns = ["h3_id", "sum_trip", "trip_class"]
-    out["sum_trip"] = pd.to_numeric(out["sum_trip"], errors="coerce")
-    out["trip_class"] = pd.to_numeric(out["trip_class"], errors="coerce")
-    out = out.dropna(subset=["h3_id", "sum_trip"])
-    out["h3_id"] = out["h3_id"].astype(str)
-
-    # If a source has duplicate H3 rows, consolidate them before joining.
-    out = (
-        out.groupby("h3_id", as_index=False)
-        .agg(sum_trip=("sum_trip", "sum"),
-             trip_class=("trip_class", "mean"))
-    )
-    return out
-
-
 def _prepare_lanes(input_path):
     g = gpd.read_file(input_path)
 
     if g.empty:
         raise ValueError("GeoJSON не содержит объектов.")
 
-    # Normalize common source field names.
     cols = {str(c).lower(): c for c in g.columns}
 
     def pick(*names):
@@ -119,13 +57,20 @@ def _prepare_lanes(input_path):
     status_col = pick("status", "STATUS")
     zone_col = pick("zone", "ZONE")
 
-    g = g[g.geometry.notna() & ~g.geometry.is_empty & g.geometry.is_valid].copy()
+    g = g[g.geometry.notna() & ~g.geometry.is_empty].copy()
     g = g[g.geometry.geom_type.isin(["LineString", "MultiLineString"])].copy()
 
     if g.empty:
         raise ValueError("После очистки не осталось корректных линий.")
 
+    # Work in WGS84 for H3.
     g = g.to_crs(4326)
+
+    # Repair only invalid line geometries if any remain.
+    invalid = ~g.geometry.is_valid
+    if invalid.any():
+        g.loc[invalid, "geometry"] = g.loc[invalid, "geometry"].buffer(0)
+        g = g[g.geometry.geom_type.isin(["LineString", "MultiLineString"])].copy()
 
     g["velo_id"] = g.geometry.apply(
         lambda geom: hashlib.md5(geom.wkb).hexdigest()[:16]
@@ -140,33 +85,123 @@ def _prepare_lanes(input_path):
     return g[["velo_id", "name", "type", "status", "zone", "geometry"]]
 
 
-def _candidate_h3(h3_lookup, lanes):
-    # Important Render optimization:
-    # do not spatial-join against all 600k cells when the uploaded file
-    # occupies only a fraction of the dictionary extent.
+def _h3_cells_for_geometry(geometry):
+    """Return H3 r12 cells covering a conservative candidate area around geometry.
+
+    H3 is used as the spatial index. We do not load the 600k-cell WKT dictionary.
+    The candidate area is intentionally wider than the final 5 m buffer; exact
+    intersection with the 5 m buffer is performed afterwards.
+    """
+    candidate_geom = geometry.buffer(0) if not geometry.is_valid else geometry
+    candidate_geom = candidate_geom.buffer(CANDIDATE_BUFFER_M / 111_320.0)
+
+    # geo_to_cells expects a GeoJSON-like geometry in lon/lat.
+    geojson = {
+        "type": "Feature",
+        "properties": {},
+        "geometry": json.loads(gpd.GeoSeries([candidate_geom], crs=4326).to_json())[
+            "features"
+        ][0]["geometry"],
+    }
+
+    return set(h3.geo_to_cells(geojson, H3_RESOLUTION))
+
+
+def _build_h3_candidates(lanes):
+    """Generate velo_id -> H3 IDs directly from H3, without 600k polygons."""
+    rows = []
+    all_cells = set()
+
+    total = len(lanes)
+    for i, row in enumerate(lanes.itertuples(index=False), start=1):
+        cells = _h3_cells_for_geometry(row.geometry)
+        all_cells.update(cells)
+        rows.extend((row.velo_id, cell) for cell in cells)
+
+        if i == 1 or i % 50 == 0 or i == total:
+            pct = 20 + int(20 * i / max(total, 1))
+            print(f"H3 index: {i}/{total} lanes, unique candidates={len(all_cells):,}")
+
+    if not rows:
+        return pd.DataFrame(columns=["velo_id", "h3_id"])
+
+    return pd.DataFrame(rows, columns=["velo_id", "h3_id"]).drop_duplicates()
+
+
+def _h3_polygon(cell):
+    # h3.cell_to_boundary returns (lat, lon) pairs.
+    boundary = h3.cell_to_boundary(cell)
+    return Polygon([(lon, lat) for lat, lon in boundary])
+
+
+def _make_exact_intersections(lanes, candidates):
+    """Exact final spatial check, but only for H3 IDs generated by H3 index."""
+    if candidates.empty:
+        return candidates
+
+    # Build only candidate H3 polygons, not the full 600k dictionary.
+    unique_cells = candidates["h3_id"].unique()
+    h3_geo = gpd.GeoDataFrame(
+        {"h3_id": unique_cells},
+        geometry=[_h3_polygon(cell) for cell in unique_cells],
+        crs=4326,
+    )
+
     lanes_utm = lanes.to_crs(32637)
-    buffered = lanes_utm.copy()
-    buffered["geometry"] = buffered.geometry.buffer(5)
+    lanes_buffered = lanes_utm[["velo_id", "geometry"]].copy()
+    lanes_buffered["geometry"] = lanes_buffered.geometry.buffer(FINAL_BUFFER_M)
 
-    minx, miny, maxx, maxy = buffered.total_bounds
+    h3_utm = h3_geo.to_crs(32637)
 
-    h3_utm = h3_lookup.to_crs(32637)
-    s = h3_utm.sindex
-    idx = list(s.intersection((minx, miny, maxx, maxy)))
-    cand = h3_utm.iloc[idx].copy()
-
-    return buffered, cand
-
-
-def _make_intersections(lanes_buffered, h3_candidates):
-    # One spatial join for all uploaded lanes.
     joined = gpd.sjoin(
-        lanes_buffered[["velo_id", "geometry"]],
-        h3_candidates[["h3_id", "geometry"]],
+        lanes_buffered,
+        h3_utm[["h3_id", "geometry"]],
         how="inner",
         predicate="intersects",
     )
-    return joined[["velo_id", "h3_id"]].drop_duplicates()
+
+    result = joined[["velo_id", "h3_id"]].drop_duplicates()
+    return result
+
+
+def _read_h3_period(path, needed_h3=None):
+    """Read one period and immediately reduce it to relevant H3 IDs."""
+    columns = None
+    try:
+        # Reading only the columns needed for the calculation keeps memory low.
+        probe = pd.read_parquet(path, engine="pyarrow")
+        h3_col = _find_col(probe, ["h3_id", "h3", "hexagon", "index"])
+        trip_col = _find_col(probe, ["sum_trip", "trips", "trip_count", "count"])
+        class_col = _find_col(probe, ["trip_class", "class", "cluster"])
+        if not h3_col or not trip_col or not class_col:
+            raise ValueError(
+                f"Не удалось определить колонки H3 в {path.name}. "
+                f"Найдены: {list(probe.columns)}"
+            )
+        columns = [h3_col, trip_col, class_col]
+        del probe
+    except Exception:
+        raise
+
+    df = pd.read_parquet(path, columns=columns, engine="pyarrow")
+    df.columns = ["h3_id", "sum_trip", "trip_class"]
+    df["h3_id"] = df["h3_id"].astype(str)
+    df["sum_trip"] = pd.to_numeric(df["sum_trip"], errors="coerce")
+    df["trip_class"] = pd.to_numeric(df["trip_class"], errors="coerce")
+    df = df.dropna(subset=["h3_id", "sum_trip"])
+
+    if needed_h3 is not None:
+        df = df[df["h3_id"].isin(needed_h3)].copy()
+
+    # Consolidate duplicate H3 rows if present in the source.
+    df = (
+        df.groupby("h3_id", as_index=False)
+        .agg(
+            sum_trip=("sum_trip", "sum"),
+            trip_class=("trip_class", "mean"),
+        )
+    )
+    return df
 
 
 def _percent_rank(s):
@@ -195,7 +230,11 @@ def _score_period(intersections, h3_data, period):
     )
 
     g["std_trips"] = g["std_trips"].fillna(0)
-    g["cv"] = np.where(g["avg_trips"] > 0, g["std_trips"] / g["avg_trips"], 0)
+    g["cv"] = np.where(
+        g["avg_trips"] > 0,
+        g["std_trips"] / g["avg_trips"],
+        0,
+    )
     g["homogeneity"] = 1 - np.minimum(g["cv"], 1)
 
     g["rank_avg"] = _percent_rank(g["avg_trips"])
@@ -220,36 +259,52 @@ def process_job(input_path, job_dir, data_dir, progress=None):
     data_dir = Path(data_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
 
+    print("=== VELO DEMAND: H3 INDEX MODE ===", flush=True)
+
     _progress(progress, 5, "Читаем GeoJSON")
+    print("[1/6] Reading GeoJSON...", flush=True)
     lanes = _prepare_lanes(input_path)
+    print(f"[1/6] Lanes: {len(lanes):,}", flush=True)
 
     _progress(progress, 15, f"Подготовлено велодорожек: {len(lanes):,}")
 
-    _progress(progress, 20, "Загружаем H3-слой")
-    h3_lookup = _load_h3_lookup(data_dir)
+    _progress(progress, 20, "Получаем H3 ID для велодорожек")
+    print("[2/6] Generating H3 IDs directly from geometry...", flush=True)
+    candidates = _build_h3_candidates(lanes)
+    unique_candidate_count = candidates["h3_id"].nunique() if not candidates.empty else 0
+    print(f"[2/6] Unique H3 candidates: {unique_candidate_count:,}", flush=True)
+    _progress(progress, 40, f"Получено H3-кандидатов: {unique_candidate_count:,}")
 
-    _progress(progress, 30, "Отбираем H3-кандидатов по bbox")
-    lanes_buffered, candidates = _candidate_h3(h3_lookup, lanes)
+    _progress(progress, 45, "Проверяем точные пересечения")
+    print("[3/6] Exact intersection only for H3 candidates...", flush=True)
+    intersections = _make_exact_intersections(lanes, candidates)
+    print(f"[3/6] Exact intersections: {len(intersections):,}", flush=True)
+    _progress(progress, 50, f"Точных пересечений: {len(intersections):,}")
 
-    _progress(progress, 40, f"H3-кандидатов: {len(candidates):,}")
-
-    intersections = _make_intersections(lanes_buffered, candidates)
-    _progress(progress, 48, f"Получено пересечений: {len(intersections):,}")
-
-    del lanes_buffered, candidates
+    del candidates
     gc.collect()
 
-    period_results = []
-    for i, (period, filename) in enumerate(PERIODS.items()):
-        _progress(progress, 50 + i * 14, f"Считаем {period}")
+    if intersections.empty:
+        raise ValueError(
+            "Не найдено ни одного пересечения велодорог с H3. "
+            "Проверьте CRS и геометрию GeoJSON."
+        )
 
+    needed_h3 = set(intersections["h3_id"].astype(str))
+    period_results = []
+
+    for i, (period, filename) in enumerate(PERIODS.items()):
+        base = 52 + i * 14
+        _progress(progress, base, f"Считаем {period}")
         path = data_dir / filename
         if not path.exists():
             raise FileNotFoundError(f"Не найден файл H3: {path}")
 
-        h3_data = _read_h3_period(path)
-        r = _score_period(intersections, h3_data, period)
+        print(f"[4-6/6] Reading {period}...", flush=True)
+        h3_data = _read_h3_period(path, needed_h3=needed_h3)
+        print(f"[{period}] Relevant H3 rows: {len(h3_data):,}", flush=True)
 
+        r = _score_period(intersections, h3_data, period)
         if not r.empty:
             period_results.append(r)
 
@@ -257,21 +312,23 @@ def process_job(input_path, job_dir, data_dir, progress=None):
         gc.collect()
 
     if not period_results:
-        raise ValueError("Не найдено ни одного пересечения велодорог с H3.")
+        raise ValueError("Не найдено данных H3 для пересечений.")
 
     all_periods = pd.concat(period_results, ignore_index=True)
 
-    # Attach source attributes and keep geometry.
-    summary = lanes[["velo_id", "name", "type", "status", "zone"]].merge(
-        all_periods,
-        on="velo_id",
-        how="left",
-    )
+    _progress(progress, 95, "Формируем CSV и GeoJSON")
+    print("[6/6] Writing results...", flush=True)
 
-    # Period CSVs.
+    meta = lanes[["velo_id", "name", "type", "status", "zone"]]
+    summary = meta.merge(all_periods, on="velo_id", how="left")
+
     for period in PERIODS:
         p = summary[summary["period"] == period].copy()
-        p.to_csv(job_dir / f"velo_demand_{period}.csv", index=False, encoding="utf-8-sig")
+        p.to_csv(
+            job_dir / f"velo_demand_{period}.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
 
     all_periods.to_csv(
         job_dir / "velo_demand_all_periods.csv",
@@ -286,13 +343,11 @@ def process_job(input_path, job_dir, data_dir, progress=None):
         aggfunc="first",
     ).reset_index()
 
-    for p in PERIODS:
-        if p not in pivot.columns:
-            pivot[p] = np.nan
+    for period in PERIODS:
+        if period not in pivot.columns:
+            pivot[period] = np.nan
 
     pivot["score_3_periods"] = pivot[list(PERIODS)].mean(axis=1)
-
-    meta = lanes[["velo_id", "name", "type", "status", "zone"]]
     summary_csv = meta.merge(pivot, on="velo_id", how="left")
     summary_csv.to_csv(
         job_dir / "velo_demand_summary_3_periods.csv",
@@ -300,27 +355,21 @@ def process_job(input_path, job_dir, data_dir, progress=None):
         encoding="utf-8-sig",
     )
 
-    # GeoJSON: one feature per unique uploaded geometry with all period scores.
-    geo = lanes.merge(summary_csv, on=["velo_id", "name", "type", "status", "zone"], how="left")
-    geo = geo.replace({np.nan: None})
-
-    # Avoid NaN/Inf in JSON.
-    numeric_cols = [
-        c for c in geo.columns
-        if c not in {"velo_id", "name", "type", "status", "zone", "geometry"}
-    ]
-    for c in numeric_cols:
-        geo[c] = pd.to_numeric(geo[c], errors="coerce")
-
+    geo = lanes.merge(
+        summary_csv,
+        on=["velo_id", "name", "type", "status", "zone"],
+        how="left",
+    )
     geo = geo.replace([np.inf, -np.inf], np.nan)
     geo.to_file(job_dir / "result.geojson", driver="GeoJSON")
 
     _progress(progress, 100, "Результат готов")
+    print("=== DONE ===", flush=True)
 
     return {
         "lanes": int(len(lanes)),
-        "h3_cells": int(len(h3_lookup)),
-        "h3_candidates": int(len(set(intersections["h3_id"]))),
+        "h3_cells": int(unique_candidate_count),
+        "h3_candidates": int(unique_candidate_count),
         "intersections": int(len(intersections)),
         "periods": list(PERIODS.keys()),
         "downloads": {
