@@ -23,7 +23,7 @@ button{cursor:pointer}
 .links a{display:inline-flex;align-items:center;gap:6px;color:#222;text-decoration:none;background:#fff;border:1px solid #d1d5db;padding:8px 11px;border-radius:7px;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.05)} .links a:hover{background:#f3f4f6;border-color:#9ca3af}
 #mapWrap{position:relative}
 #map{height:calc(100vh - 16px);min-height:520px;margin-bottom:-42px}
-#deckH3{position:absolute;inset:0;z-index:350;pointer-events:none;overflow:hidden} #deckH3 canvas{pointer-events:none!important} .leaflet-control-container{z-index:800} .leaflet-top,.leaflet-bottom{z-index:900}
+#deckH3{display:none}.h3-canvas-pane{z-index:350!important}.h3Canvas{pointer-events:none}.leaflet-control-container{z-index:800} .leaflet-top,.leaflet-bottom{z-index:900}
 .grayscale-tiles{filter:grayscale(1) contrast(.94) brightness(1.04)}
 
 #controlPanel{background:rgba(255,255,255,.97);padding:13px 14px;line-height:1.35;box-shadow:0 4px 18px rgba(0,0,0,.18);border:1px solid rgba(0,0,0,.08);border-radius:12px;min-width:300px;max-width:340px;backdrop-filter:blur(5px)}
@@ -53,6 +53,11 @@ button{cursor:pointer}
 .top5Meta{color:#6b7280;margin-top:2px;padding-left:23px}
 @media(max-width:700px){.top5Grid{grid-template-columns:1fr}}
 
+#rankingPanel{background:rgba(255,255,255,.98);padding:12px 14px;line-height:1.35;box-shadow:0 4px 18px rgba(0,0,0,.18);border:1px solid rgba(0,0,0,.08);border-radius:12px;min-width:320px;max-width:380px;backdrop-filter:blur(5px)}
+#rankingPanel .top5Section{margin:0;border:0;padding:0}
+#rankingPanel .top5Grid{grid-template-columns:1fr 1fr;gap:9px}
+#rankingPanel .top5Block{background:#f7f8fa}
+@media(max-width:900px){#rankingPanel{min-width:280px;max-width:calc(100vw - 30px)}#rankingPanel .top5Grid{grid-template-columns:1fr}}
 details.method{margin-top:11px;border-top:1px solid var(--line);padding-top:9px}
 details.method summary{cursor:pointer;font-weight:700;font-size:13px;list-style:none}
 details.method summary::-webkit-details-marker{display:none}
@@ -129,7 +134,7 @@ function scoreColor(cat,score){
   const light=92-(Math.max(0,Math.min(100,n))*0.64);
   return `hsl(0 78% ${light}%)`;
 }
-function yearLabel(){return selectedYear==="3periods"?"3 периода":selectedYear}
+function yearLabel(){return selectedYear==="3periods"?"Все периоды":selectedYear}
 function scoreField(){return selectedYear==="3periods"?"score_3_periods":selectedYear==="2024"?"24_07":selectedYear==="2025"?"25_07":"26_07"}
 function categoryField(){return selectedYear==="3periods"?"demand_category_3_periods":selectedYear==="2024"?"category_24_07":selectedYear==="2025"?"category_25_07":"category_26_07"}
 
@@ -162,7 +167,7 @@ function makePopup(feature){
     <div class="popupCategory" style="color:${scoreColor(cat,score)}">${esc(cat)}</div>
     ${detail}
     <hr style="border:0;border-top:1px solid #ddd;margin:8px 0">
-    <div class="popupSmall">2024: ${fmt(p["24_07"])} · 2025: ${fmt(p["25_07"])} · 2026: ${fmt(p["26_07"])} · 3 периода: ${fmtScore(p.score_3_periods)}</div>`;
+    <div class="popupSmall">2024: ${fmt(p["24_07"])} · 2025: ${fmt(p["25_07"])} · 2026: ${fmt(p["26_07"])} · Все периоды: ${fmtScore(p.score_3_periods)}</div>`;
 }
 
 function styleFeature(feature){
@@ -224,6 +229,7 @@ function renderTop5(){
 
 function updatePanel(){
   const title=$("panelTitle"); if(title)title.textContent="Спрос — "+yearLabel();
+  const rankTitle=document.querySelector("#rankingPanel .top5Title"); if(rankTitle)rankTitle.textContent="Рейтинг велодорожек — "+yearLabel();
   document.querySelectorAll(".yearBtn").forEach(b=>b.classList.toggle("active",b.dataset.year===selectedYear));
   renderTop5();
 }
@@ -238,7 +244,7 @@ function createControlPanel(){
         <button type="button" class="yearBtn" data-year="2024">2024</button>
         <button type="button" class="yearBtn" data-year="2025">2025</button>
         <button type="button" class="yearBtn active" data-year="2026">2026</button>
-        <button type="button" class="yearBtn" data-year="3periods">3 периода</button>
+        <button type="button" class="yearBtn" data-year="3periods">Все периоды</button>
       </div>
       <div id="legendRows"><div class="methodLead" style="margin:2px 0 4px">Цвет велодорожки показывает итоговый балл спроса:</div><div class="veloGradient"></div><div class="gradientLabels"><span>0 · ниже спрос</span><span>100 · выше спрос</span></div></div>
       <div class="layerPanel">
@@ -249,19 +255,6 @@ function createControlPanel(){
         <div class="h3Legend">
           <div class="veloGradient"></div>
           <div class="gradientLabels"><span>Меньше проездов</span><span>Больше проездов</span></div>
-        </div>
-      </div>
-      <div class="top5Section">
-        <div class="top5Title">Рейтинг велодорожек</div>
-        <div class="top5Grid">
-          <div class="top5Block">
-            <div class="top5BlockTitle">🔥 Топ-5 по востребованности</div>
-            <div id="top5High"><div class="popupSmall">Нет данных</div></div>
-          </div>
-          <div class="top5Block">
-            <div class="top5BlockTitle">Топ-5 с наименьшей востребованностью</div>
-            <div id="top5Low"><div class="popupSmall">Нет данных</div></div>
-          </div>
         </div>
       </div>
       <details class="method">
@@ -286,12 +279,37 @@ function createControlPanel(){
 }
 createControlPanel();
 
+function createRankingPanel(){
+  const panel=L.control({position:"bottomright"});
+  panel.onAdd=function(){
+    const div=L.DomUtil.create("div"); div.id="rankingPanel";
+    div.innerHTML=`
+      <div class="top5Section">
+        <div class="top5Title">Рейтинг велодорожек — ${esc(yearLabel())}</div>
+        <div class="top5Grid">
+          <div class="top5Block">
+            <div class="top5BlockTitle">🔥 Топ-5 по востребованности</div>
+            <div id="top5High"><div class="popupSmall">Нет данных</div></div>
+          </div>
+          <div class="top5Block">
+            <div class="top5BlockTitle">Топ-5 с наименьшей востребованностью</div>
+            <div id="top5Low"><div class="popupSmall">Нет данных</div></div>
+          </div>
+        </div>
+      </div>`;
+    L.DomEvent.disableClickPropagation(div); L.DomEvent.disableScrollPropagation(div);
+    return div;
+  };
+  panel.addTo(map);
+}
+createRankingPanel();
+
 // ---------------- H3 ----------------
-let deckH3=null, currentH3Rows=[], currentH3Index=new Map(), currentH3Resolution=null, streetDictionary=null;
+let h3Layer=null, currentH3Rows=[], currentH3Index=new Map(), currentH3Resolution=null, streetDictionary=null;
 let currentH3Year=null, h3LoadToken=0;
-const H3_CLASS_COLORS={1:[254,229,229,115],2:[252,165,165,130],3:[239,68,68,145],4:[185,28,28,165],5:[127,29,29,180]};
-// Более редкий LOD: не тянем 600 тыс. ячеек на обычных зумах.
-function h3Resolution(z){if(z>=16)return 12;if(z>=14)return 11;if(z>=12)return 10;if(z>=10)return 9;return 8}
+const H3_CLASS_COLORS={1:[254,229,229,150],2:[252,165,165,170],3:[239,68,68,185],4:[185,28,28,200],5:[127,29,29,215]};
+// Лёгкий LOD: максимум res 11, чтобы не тянуть сотни тысяч ячеек в браузер.
+function h3Resolution(z){if(z>=15)return 11;if(z>=12)return 10;if(z>=10)return 9;return 8}
 function getH3Class(row){const n=Number(row.trip_class);return Math.max(1,Math.min(5,Math.round(Number.isFinite(n)?n:1)))}
 async function parquetRows(url,columns){
   const lib=await import("https://esm.sh/hyparquet@1.31.1?bundle");
@@ -315,82 +333,101 @@ function buildH3AtResolution(rows,res){
     const parent=h3.cellToParent(r.h3_id,res);
     let x=m.get(parent);
     if(!x)x={h3_id:parent,sum:0,classSum:0,count:0};
-    x.sum+=r.sum_trip;x.classSum+=r.trip_class;x.count++;m.set(parent,x);
+    x.sum+=r.sum_trip;x.classSum+=r.trip_class;x.count++;
+    m.set(parent,x);
   }
   return Array.from(m.values()).map(x=>({h3_id:x.h3_id,sum_trip:x.count?x.sum/x.count:0,trip_class:x.count?x.classSum/x.count:1}));
 }
-function ensureDeck(){
-  if(deckH3)return;
-  deckH3=new deck.Deck({parent:$('deckH3'),controller:false,initialViewState:{longitude:37.75,latitude:55.79,zoom:11,pitch:0,bearing:0},layers:[]});
-  map.on('move',syncDeckView); syncDeckView();
+function h3Color(row){
+  const c=H3_CLASS_COLORS[getH3Class(row)]||H3_CLASS_COLORS[1];
+  return `rgba(${c[0]},${c[1]},${c[2]},${(c[3]/255).toFixed(3)})`;
 }
-function syncDeckView(){if(!deckH3)return;const c=map.getCenter();deckH3.setProps({viewState:{longitude:c.lng,latitude:c.lat,zoom:map.getZoom(),pitch:0,bearing:0}})}
-function makeH3Color(d){
-  const c=H3_CLASS_COLORS[getH3Class(d)]||H3_CLASS_COLORS[1];
-  return c;
+function clearH3Layer(){
+  if(h3Layer){map.removeLayer(h3Layer);h3Layer=null}
 }
-function makeH3Layers(rows){
-  if(!h3Visible||!rows.length)return [];
-  // Один слой вместо пяти — меньше WebGL-объектов и меньше накладных расходов.
-  return [new deck.H3HexagonLayer({
-    id:`h3-${selectedYear}-${currentH3Resolution}`,
-    data:rows,
-    getHexagon:d=>d.h3_id,
-    getFillColor:makeH3Color,
-    filled:true,
-    stroked:false,
-    coverage:.95,
-    pickable:false,
-    updateTriggers:{getFillColor:[currentH3Resolution]}
-  })];
-}
-function updateH3Layers(){
-  ensureDeck(); deckH3.setProps({layers:makeH3Layers(currentH3Rows)});
-  $('h3Status').textContent=h3Visible?`H3: ${currentH3Rows.length.toLocaleString('ru-RU')} ячеек · res ${currentH3Resolution}`:'H3: выключены';
+function updateH3Layer(){
+  clearH3Layer();
+  if(!h3Visible||!currentH3Rows.length){
+    $("h3Status").textContent=h3Visible?`H3: нет данных`:'H3: выключены';
+    return;
+  }
+  const renderer=L.canvas({padding:0.5});
+  const group=[];
+  for(const r of currentH3Rows){
+    try{
+      const boundary=h3.cellToBoundary(r.h3_id,true);
+      const poly=L.polygon(boundary,{renderer,stroke:false,fill:true,fillColor:h3Color(r),fillOpacity:1,interactive:false});
+      group.push(poly);
+    }catch(e){}
+  }
+  h3Layer=L.layerGroup(group).addTo(map);
+  $("h3Status").textContent=`H3: ${currentH3Rows.length.toLocaleString('ru-RU')} ячеек · res ${currentH3Resolution}`;
 }
 async function refreshH3(){
-  ensureDeck();
   if(selectedYear==='3periods'){
-    currentH3Rows=[];currentH3Index=new Map();updateH3Layers();$('h3Status').textContent='H3: для режима «3 периода» слой скрыт';return;
+    currentH3Rows=[];currentH3Index=new Map();clearH3Layer();
+    $('h3Status').textContent='H3: для режима «Все периоды» слой скрыт';
+    return;
   }
   const res=h3Resolution(map.getZoom());
-  if(res===currentH3Resolution && currentH3Year===selectedYear && currentH3Rows.length){updateH3Layers();return;}
+  if(res===currentH3Resolution && currentH3Year===selectedYear && currentH3Rows.length){
+    updateH3Layer(); return;
+  }
   currentH3Resolution=res;
   $('h3Status').textContent=`H3: загрузка ${selectedYear} · res ${res}…`;
   try{
     const rows=await loadH3Period(selectedYear);
-    if(!rows.length){currentH3Rows=[];currentH3Index=new Map();updateH3Layers();return;}
-    // Не держим предыдущий разрешение/набор в памяти после пересчета.
+    if(!rows.length){currentH3Rows=[];currentH3Index=new Map();updateH3Layer();return;}
     currentH3Rows=buildH3AtResolution(rows,res);
     currentH3Index=new Map(currentH3Rows.map(r=>[r.h3_id,r]));
-    updateH3Layers();
-  }catch(e){console.error(e);$('h3Status').textContent=`H3: ошибка — ${e.message||'неизвестная ошибка'}`;}
+    updateH3Layer();
+  }catch(e){
+    console.error(e); clearH3Layer();
+    $('h3Status').textContent=`H3: ошибка — ${e.message||'неизвестная ошибка'}`;
+  }
 }
-let lastH3Zoom=map.getZoom();
-map.on('zoomend',()=>{const z=map.getZoom();const next=h3Resolution(z);if(next!==currentH3Resolution){lastH3Zoom=z;refreshH3()}});
+map.on('zoomend',()=>{
+  const next=h3Resolution(map.getZoom());
+  if(next!==currentH3Resolution)refreshH3();
+});
 map.on('click',e=>{
   if(!h3Visible||!currentH3Rows.length)return;
   const target=e.originalEvent&&e.originalEvent.target;
   if(target&&target.closest&&target.closest('.leaflet-interactive'))return;
-  try{const id=h3.latLngToCell(e.latlng.lat,e.latlng.lng,currentH3Resolution);const row=currentH3Index.get(id);if(row)showH3Info(row)}catch(err){}
+  try{
+    const id=h3.latLngToCell(e.latlng.lat,e.latlng.lng,currentH3Resolution);
+    const row=currentH3Index.get(id); if(row)showH3Info(row);
+  }catch(err){}
 });
 async function loadStreetDictionaryLazy(){
   if(streetDictionary)return streetDictionary;
   $('h3Status').textContent='H3: загружаем справочник улиц…';
   const rows=await parquetRows('/api/h3/h3_hexagons_12_600_street_tr.parquet',['h3_id','street_names','soft_name']);
-  const m=new Map(); for(const r of rows){const id=String(r.h3_id||'');if(id)m.set(id,{streets:String(r.street_names||'').split(',').map(x=>x.trim()).filter(Boolean),softName:String(r.soft_name||'')})}
+  const m=new Map();
+  for(const r of rows){
+    const id=String(r.h3_id||'');
+    if(id)m.set(id,{streets:String(r.street_names||'').split(',').map(x=>x.trim()).filter(Boolean),softName:String(r.soft_name||'')});
+  }
   streetDictionary=m; return m;
 }
 async function showH3Info(row){
   const id=row.h3_id; let streetText='';
   try{
-    const dict=await loadStreetDictionaryLazy(); const ids=h3.getResolution(id)===12?[id]:h3.cellToChildren(id,12); const streets=new Set(),soft=new Set();
-    for(const child of ids){const x=dict.get(child);if(!x)continue;x.streets.forEach(v=>streets.add(v));if(x.softName)soft.add(x.softName)}
-    streetText=[...streets].slice(0,20).map(v=>`• ${esc(v)}`).join('<br>')||'Нет данных'; if(streets.size>20)streetText+=`<br><span style="color:#777">и ещё ${streets.size-20} улиц</span>`; streetText=`${esc([...soft].join(', '))}<br>${streetText}`;
+    const dict=await loadStreetDictionaryLazy();
+    const ids=h3.getResolution(id)===12?[id]:h3.cellToChildren(id,12);
+    const streets=new Set(),soft=new Set();
+    for(const child of ids){
+      const x=dict.get(child);if(!x)continue;
+      x.streets.forEach(v=>streets.add(v));if(x.softName)soft.add(x.softName);
+    }
+    streetText=[...streets].slice(0,20).map(v=>`• ${esc(v)}`).join('<br>')||'Нет данных';
+    if(streets.size>20)streetText+=`<br><span style="color:#777">и ещё ${streets.size-20} улиц</span>`;
+    streetText=`${esc([...soft].join(', '))}<br>${streetText}`;
   }catch(e){streetText='Справочник улиц не загрузился'}
-  const ll=h3.cellToLatLng(id); L.popup({maxWidth:360}).setLatLng(ll).setContent(`<b>H3</b><br>${esc(id)}<br><br><b>Проезды:</b> ${fmt(row.sum_trip)}<br><b>Класс:</b> ${getH3Class(row)}<hr style="border:0;border-top:1px solid #ddd;margin:7px 0"><b>Улицы:</b><br>${streetText}`).openOn(map);
+  const ll=h3.cellToLatLng(id);
+  L.popup({maxWidth:360}).setLatLng(ll).setContent(`<b>H3</b><br>${esc(id)}<br><br><b>Проезды:</b> ${fmt(row.sum_trip)}<br><b>Класс:</b> ${getH3Class(row)}<hr style="border:0;border-top:1px solid #ddd;margin:7px 0"><b>Улицы:</b><br>${streetText}`).openOn(map);
 }
-$('h3Toggle').addEventListener('change',e=>{h3Visible=e.target.checked;updateH3Layers()});
+$('h3Toggle').addEventListener('change',e=>{h3Visible=e.target.checked;updateH3Layer()});
 $('veloToggle').addEventListener('change',e=>{veloVisible=e.target.checked;if(!layer)return;if(veloVisible)layer.addTo(map);else map.removeLayer(layer)});
 
 // ---------------- Result ----------------
